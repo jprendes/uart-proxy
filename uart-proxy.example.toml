@@ -1,0 +1,12 @@
+# The server accepts WebSocket connections on this address.
+listen = "127.0.0.1:7000"
+
+# Each table name becomes the WebSocket URL path.
+[ports.com1]
+device = "COM1"
+baud = 115200
+
+[ports.arduino]
+device = "/dev/ttyACM0"
+baud = 115200
+dtr_reset = false

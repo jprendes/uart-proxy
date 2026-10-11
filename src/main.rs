@@ -1,20 +1,30 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
+#[cfg(target_os = "linux")]
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
-const PROTOCOL_MAGIC: &[u8; 11] = b"UARTPROXY\x01\n";
+const PROTOCOL_MAGIC: &[u8; 11] = b"UARTPROXY\x02\n";
 const FRAME_DATA: u8 = 1;
 const FRAME_MODEM_CONTROL: u8 = 2;
 const MODEM_DTR: u8 = 1 << 0;
 const MODEM_RTS: u8 = 1 << 1;
 const MAX_FRAME_SIZE: usize = 64 * 1024;
+const DEFAULT_LISTEN: &str = "127.0.0.1:7000";
+const SINGLE_PORT_ROUTE: &str = "serial";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -25,7 +35,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Expose a physical serial port over TCP.
+    /// Expose one or more physical serial ports over WebSocket.
     Server(ServerArgs),
     /// Expose a remote serial port as a local Linux PTY.
     Client(ClientArgs),
@@ -34,27 +44,31 @@ enum Command {
 #[derive(Debug, Args)]
 struct ServerArgs {
     /// Local serial device, such as /dev/ttyACM0 or COM3.
-    #[arg(long)]
-    serial: String,
+    #[arg(long, required_unless_present = "config", conflicts_with = "config")]
+    serial: Option<String>,
+
+    /// TOML file containing named serial-port mappings.
+    #[arg(long, conflicts_with = "serial")]
+    config: Option<PathBuf>,
 
     /// Serial baud rate.
-    #[arg(long, default_value_t = 115_200)]
+    #[arg(long, default_value_t = 115_200, conflicts_with = "config")]
     baud: u32,
 
-    /// TCP address on which to listen.
-    #[arg(long, default_value = "127.0.0.1:7000")]
-    listen: SocketAddr,
+    /// Address on which to listen, overriding the configuration file.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
 
     /// Pulse DTR whenever a client connects.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     dtr_reset: bool,
 }
 
 #[derive(Debug, Args)]
 struct ClientArgs {
-    /// Remote uart-proxy server address.
+    /// Remote WebSocket URL, such as ws://server:7000/com1.
     #[arg(long)]
-    connect: SocketAddr,
+    connect: String,
 
     /// Optional stable symlink to the generated PTY.
     #[arg(long)]
@@ -69,6 +83,25 @@ struct ClientArgs {
     no_modem_control: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct SerialEndpoint {
+    device: String,
+    #[serde(default = "default_baud")]
+    baud: u32,
+    #[serde(default)]
+    dtr_reset: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerFileConfig {
+    listen: Option<SocketAddr>,
+    ports: HashMap<String, SerialEndpoint>,
+}
+
+fn default_baud() -> u32 {
+    115_200
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -78,35 +111,27 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(args: ServerArgs) -> Result<()> {
-    let listener = TcpListener::bind(args.listen)
+    let (listen, ports) = load_server_settings(args).await?;
+    let listener = TcpListener::bind(listen)
         .await
-        .with_context(|| format!("failed to listen on {}", args.listen))?;
+        .with_context(|| format!("failed to listen on {listen}"))?;
+    let ports = Arc::new(ports);
 
-    println!(
-        "serving {} at {} ({} baud)",
-        args.serial, args.listen, args.baud
-    );
+    println!("serving {} serial port(s) at ws://{listen}", ports.len());
+    for (route, endpoint) in ports.iter() {
+        println!("  /{route} -> {} ({} baud)", endpoint.device, endpoint.baud);
+    }
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("failed to accept TCP connection")?;
-                println!("client connected: {peer}");
-
-                tokio::select! {
-                    result = proxy_serial_connection(&args, stream) => {
-                        if let Err(error) = result {
-                            eprintln!("client {peer} disconnected with error: {error:#}");
-                        } else {
-                            println!("client disconnected: {peer}");
-                        }
+                let ports = Arc::clone(&ports);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_websocket_connection(stream, peer, ports).await {
+                        eprintln!("client {peer} disconnected with error: {error:#}");
                     }
-                    signal = tokio::signal::ctrl_c() => {
-                        signal.context("failed to listen for Ctrl-C")?;
-                        println!("shutting down");
-                        return Ok(());
-                    }
-                }
+                });
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl-C")?;
@@ -117,21 +142,105 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     }
 }
 
-async fn proxy_serial_connection(args: &ServerArgs, mut stream: TcpStream) -> Result<()> {
+async fn load_server_settings(
+    args: ServerArgs,
+) -> Result<(SocketAddr, HashMap<String, SerialEndpoint>)> {
+    if let Some(path) = args.config {
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read configuration {}", path.display()))?;
+        let config: ServerFileConfig = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse configuration {}", path.display()))?;
+        validate_routes(&config.ports)?;
+        if config.ports.is_empty() {
+            anyhow::bail!("configuration must define at least one port");
+        }
+        let listen = args
+            .listen
+            .or(config.listen)
+            .unwrap_or(DEFAULT_LISTEN.parse().unwrap());
+        return Ok((listen, config.ports));
+    }
+
+    let endpoint = SerialEndpoint {
+        device: args.serial.context("--serial is required")?,
+        baud: args.baud,
+        dtr_reset: args.dtr_reset,
+    };
+    let listen = args.listen.unwrap_or(DEFAULT_LISTEN.parse().unwrap());
+    Ok((
+        listen,
+        HashMap::from([(SINGLE_PORT_ROUTE.into(), endpoint)]),
+    ))
+}
+
+fn validate_routes(ports: &HashMap<String, SerialEndpoint>) -> Result<()> {
+    for route in ports.keys() {
+        if route.is_empty()
+            || route.contains('/')
+            || route.contains('?')
+            || route.contains('#')
+            || route == "."
+            || route == ".."
+        {
+            anyhow::bail!("invalid serial-port route {route:?}");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_websocket_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    ports: Arc<HashMap<String, SerialEndpoint>>,
+) -> Result<()> {
     stream
         .set_nodelay(true)
         .context("failed to configure TCP connection")?;
+    let requested_path = Arc::new(Mutex::new(None));
+    let callback_path = Arc::clone(&requested_path);
+    let mut websocket = accept_hdr_async(
+        stream,
+        move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+              response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            *callback_path.lock().expect("request path mutex poisoned") =
+                Some(request.uri().path().trim_matches('/').to_owned());
+            Ok(response)
+        },
+    )
+    .await
+    .context("WebSocket handshake failed")?;
+    let route = requested_path
+        .lock()
+        .expect("request path mutex poisoned")
+        .take()
+        .context("WebSocket request did not contain a path")?;
+    let endpoint = ports
+        .get(&route)
+        .with_context(|| format!("no serial port is configured at /{route}"))?
+        .clone();
 
-    let mut serial = tokio_serial::new(&args.serial, args.baud)
+    println!("client {peer} connected to /{route}");
+    server_handshake(&mut websocket).await?;
+    proxy_serial_connection(&endpoint, websocket).await?;
+    println!("client {peer} disconnected from /{route}");
+    Ok(())
+}
+
+async fn proxy_serial_connection(
+    endpoint: &SerialEndpoint,
+    websocket: WebSocketStream<tokio::net::TcpStream>,
+) -> Result<()> {
+    let mut serial = tokio_serial::new(&endpoint.device, endpoint.baud)
         .open_native_async()
         .with_context(|| {
             format!(
                 "failed to open serial port {} at {} baud",
-                args.serial, args.baud
+                endpoint.device, endpoint.baud
             )
         })?;
 
-    if args.dtr_reset {
+    if endpoint.dtr_reset {
         serial
             .write_data_terminal_ready(false)
             .context("failed to clear DTR")?;
@@ -145,15 +254,15 @@ async fn proxy_serial_connection(args: &ServerArgs, mut stream: TcpStream) -> Re
             .context("failed to finish DTR pulse")?;
     }
 
-    server_handshake(&mut stream).await?;
+    let (mut websocket_writer, mut websocket_reader) = websocket.split();
     let mut serial_buffer = [0_u8; 8192];
     let mut from_client = 0_u64;
     let mut from_serial = 0_u64;
 
     loop {
         tokio::select! {
-            frame = read_frame(&mut stream) => {
-                match frame? {
+            message = websocket_reader.next() => {
+                match read_websocket_frame(message)? {
                     Some(Frame::Data(data)) => {
                         serial.write_all(&data).await.context("failed to write to serial port")?;
                         from_client += data.len() as u64;
@@ -161,6 +270,13 @@ async fn proxy_serial_connection(args: &ServerArgs, mut stream: TcpStream) -> Re
                     Some(Frame::ModemControl { mask, values }) => {
                         apply_modem_control(&mut serial, mask, values)?;
                     }
+                    Some(Frame::Ping(payload)) => {
+                        websocket_writer
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed to send WebSocket pong")?;
+                    }
+                    Some(Frame::Ignore) => {}
                     None => {
                         println!(
                             "forwarded {from_client} bytes to serial and {from_serial} bytes to TCP"
@@ -174,24 +290,24 @@ async fn proxy_serial_connection(args: &ServerArgs, mut stream: TcpStream) -> Re
                 if bytes_read == 0 {
                     anyhow::bail!("serial port reached end of stream");
                 }
-                write_data_frame(&mut stream, &serial_buffer[..bytes_read]).await?;
+                write_data_frame(&mut websocket_writer, &serial_buffer[..bytes_read]).await?;
                 from_serial += bytes_read as u64;
             }
         }
     }
 }
 
-async fn server_handshake(stream: &mut TcpStream) -> Result<()> {
-    let mut magic = [0_u8; PROTOCOL_MAGIC.len()];
-    stream
-        .read_exact(&mut magic)
+async fn server_handshake(websocket: &mut WebSocketStream<tokio::net::TcpStream>) -> Result<()> {
+    let message = websocket
+        .next()
         .await
+        .context("client disconnected before protocol handshake")?
         .context("failed to read protocol handshake")?;
-    if &magic != PROTOCOL_MAGIC {
+    if !matches!(message, Message::Binary(payload) if payload.as_ref() == PROTOCOL_MAGIC) {
         anyhow::bail!("client uses an unsupported protocol");
     }
-    stream
-        .write_all(PROTOCOL_MAGIC)
+    websocket
+        .send(Message::Binary(PROTOCOL_MAGIC.to_vec().into()))
         .await
         .context("failed to send protocol handshake")
 }
@@ -220,76 +336,80 @@ fn apply_modem_control(
 enum Frame {
     Data(Vec<u8>),
     ModemControl { mask: u8, values: u8 },
+    Ping(tokio_tungstenite::tungstenite::Bytes),
+    Ignore,
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame>> {
-    let frame_type = match reader.read_u8().await {
-        Ok(frame_type) => frame_type,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error).context("failed to read frame type"),
+fn read_websocket_frame(
+    message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) -> Result<Option<Frame>> {
+    let message = match message {
+        Some(message) => message.context("failed to read WebSocket message")?,
+        None => return Ok(None),
     };
-    let length = reader
-        .read_u32()
-        .await
-        .context("failed to read frame length")? as usize;
-    if length > MAX_FRAME_SIZE {
-        anyhow::bail!("frame length {length} exceeds maximum {MAX_FRAME_SIZE}");
+    let payload = match message {
+        Message::Binary(payload) => payload,
+        Message::Close(_) => return Ok(None),
+        Message::Ping(payload) => return Ok(Some(Frame::Ping(payload))),
+        Message::Pong(_) => return Ok(Some(Frame::Ignore)),
+        Message::Text(_) => anyhow::bail!("text WebSocket messages are not supported"),
+        Message::Frame(_) => anyhow::bail!("unexpected raw WebSocket frame"),
+    };
+    if payload.is_empty() {
+        anyhow::bail!("empty WebSocket protocol frame");
+    }
+    if payload.len() > MAX_FRAME_SIZE + 1 {
+        anyhow::bail!("WebSocket frame exceeds maximum size");
     }
 
-    let mut payload = vec![0_u8; length];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("failed to read frame payload")?;
-
-    match frame_type {
-        FRAME_DATA => Ok(Some(Frame::Data(payload))),
-        FRAME_MODEM_CONTROL if payload.len() == 2 => Ok(Some(Frame::ModemControl {
-            mask: payload[0],
-            values: payload[1],
+    match payload[0] {
+        FRAME_DATA => Ok(Some(Frame::Data(payload[1..].to_vec()))),
+        FRAME_MODEM_CONTROL if payload.len() == 3 => Ok(Some(Frame::ModemControl {
+            mask: payload[1],
+            values: payload[2],
         })),
         FRAME_MODEM_CONTROL => {
-            anyhow::bail!("invalid modem-control frame length {}", payload.len())
+            anyhow::bail!("invalid modem-control frame length {}", payload.len() - 1)
         }
-        _ => anyhow::bail!("unknown frame type {frame_type}"),
+        frame_type => anyhow::bail!("unknown frame type {frame_type}"),
     }
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frame_type: u8,
-    payload: &[u8],
-) -> Result<()> {
+async fn write_frame<S>(writer: &mut S, frame_type: u8, payload: &[u8]) -> Result<()>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    writer
+        .send(encode_frame(frame_type, payload)?)
+        .await
+        .context("failed to write WebSocket frame")
+}
+
+fn encode_frame(frame_type: u8, payload: &[u8]) -> Result<Message> {
     if payload.len() > MAX_FRAME_SIZE {
         anyhow::bail!(
             "frame payload length {} exceeds maximum {MAX_FRAME_SIZE}",
             payload.len()
         );
     }
-    writer
-        .write_u8(frame_type)
-        .await
-        .context("failed to write frame type")?;
-    writer
-        .write_u32(payload.len() as u32)
-        .await
-        .context("failed to write frame length")?;
-    writer
-        .write_all(payload)
-        .await
-        .context("failed to write frame payload")
+    let mut message = Vec::with_capacity(payload.len() + 1);
+    message.push(frame_type);
+    message.extend_from_slice(payload);
+    Ok(Message::Binary(message.into()))
 }
 
-async fn write_data_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
+async fn write_data_frame<S>(writer: &mut S, data: &[u8]) -> Result<()>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     write_frame(writer, FRAME_DATA, data).await
 }
 
-#[cfg(any(target_os = "linux", test))]
-async fn write_modem_control_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    mask: u8,
-    values: u8,
-) -> Result<()> {
+#[cfg(target_os = "linux")]
+async fn write_modem_control_frame<S>(writer: &mut S, mask: u8, values: u8) -> Result<()>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     write_frame(writer, FRAME_MODEM_CONTROL, &[mask, values]).await
 }
 
@@ -301,6 +421,17 @@ async fn run_client(args: ClientArgs) -> Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::pty::openpty;
     use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+    let uri: tokio_tungstenite::tungstenite::http::Uri = args
+        .connect
+        .parse()
+        .with_context(|| format!("invalid WebSocket URL {}", args.connect))?;
+    if !matches!(uri.scheme_str(), Some("ws" | "wss")) {
+        anyhow::bail!("client URL must use ws:// or wss://");
+    }
+    if uri.path().trim_matches('/').is_empty() {
+        anyhow::bail!("client URL must include a serial-port path");
+    }
 
     let pty = openpty(None, None).context("failed to create PTY")?;
     let mut settings = tcgetattr(&pty.slave).context("failed to read PTY settings")?;
@@ -335,11 +466,11 @@ async fn run_client(args: ClientArgs) -> Result<()> {
 
     loop {
         println!("connecting to {}", args.connect);
-        let mut stream = loop {
+        let mut websocket = loop {
             tokio::select! {
-                connection = TcpStream::connect(args.connect) => {
+                connection = connect_async(args.connect.as_str()) => {
                     match connection {
-                        Ok(stream) => break stream,
+                        Ok((websocket, _response)) => break websocket,
                         Err(error) => {
                             eprintln!("connection failed: {error}; retrying");
                             tokio::select! {
@@ -361,31 +492,37 @@ async fn run_client(args: ClientArgs) -> Result<()> {
             }
         };
 
-        stream
-            .set_nodelay(true)
-            .context("failed to configure TCP connection")?;
-        client_handshake(&mut stream).await?;
+        client_handshake(&mut websocket).await?;
         if let Some(watcher) = &open_watcher {
             let values = if watcher.is_open() { MODEM_DTR } else { 0 };
-            write_modem_control_frame(&mut stream, MODEM_DTR, values).await?;
+            write_modem_control_frame(&mut websocket, MODEM_DTR, values).await?;
         }
         println!("connected to {}", args.connect);
-        let (mut tcp_reader, mut tcp_writer) = stream.into_split();
+        let (mut websocket_writer, mut websocket_reader) = websocket.split();
         let mut pty_buffer = [0_u8; 8192];
 
         loop {
             tokio::select! {
-                frame = read_frame(&mut tcp_reader) => {
-                    match frame {
+                message = websocket_reader.next() => {
+                    match read_websocket_frame(message) {
                         Ok(Some(Frame::Data(data))) => {
-                            pty_writer
-                                .write_all(&data)
-                                .await
-                                .context("failed to write remote data to PTY")?;
+                            if !data.is_empty() {
+                                pty_writer
+                                    .write_all(&data)
+                                    .await
+                                    .context("failed to write remote data to PTY")?;
+                            }
                         }
                         Ok(Some(Frame::ModemControl { .. })) => {
                             anyhow::bail!("server sent an unexpected modem-control frame");
                         }
+                        Ok(Some(Frame::Ping(payload))) => {
+                            websocket_writer
+                                .send(Message::Pong(payload))
+                                .await
+                                .context("failed to send WebSocket pong")?;
+                        }
+                        Ok(Some(Frame::Ignore)) => {}
                         Ok(None) => {
                             eprintln!("connection closed; retrying");
                             break;
@@ -402,7 +539,7 @@ async fn run_client(args: ClientArgs) -> Result<()> {
                         anyhow::bail!("local PTY reached end of stream");
                     }
                     if let Err(error) =
-                        write_data_frame(&mut tcp_writer, &pty_buffer[..bytes_read]).await
+                        write_data_frame(&mut websocket_writer, &pty_buffer[..bytes_read]).await
                     {
                         eprintln!("connection lost: {error:#}; retrying");
                         break;
@@ -412,7 +549,7 @@ async fn run_client(args: ClientArgs) -> Result<()> {
                     let asserted = dtr.context("failed to monitor PTY open state")?;
                     let values = if asserted { MODEM_DTR } else { 0 };
                     if let Err(error) =
-                        write_modem_control_frame(&mut tcp_writer, MODEM_DTR, values).await
+                        write_modem_control_frame(&mut websocket_writer, MODEM_DTR, values).await
                     {
                         eprintln!("connection lost: {error:#}; retrying");
                         break;
@@ -446,17 +583,20 @@ async fn run_client(args: ClientArgs) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn client_handshake(stream: &mut TcpStream) -> Result<()> {
-    stream
-        .write_all(PROTOCOL_MAGIC)
+async fn client_handshake<S>(websocket: &mut WebSocketStream<S>) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    websocket
+        .send(Message::Binary(PROTOCOL_MAGIC.to_vec().into()))
         .await
         .context("failed to send protocol handshake")?;
-    let mut magic = [0_u8; PROTOCOL_MAGIC.len()];
-    stream
-        .read_exact(&mut magic)
+    let message = websocket
+        .next()
         .await
+        .context("server disconnected before protocol handshake")?
         .context("failed to read protocol handshake")?;
-    if &magic != PROTOCOL_MAGIC {
+    if !matches!(message, Message::Binary(payload) if payload.as_ref() == PROTOCOL_MAGIC) {
         anyhow::bail!("server uses an unsupported protocol");
     }
     Ok(())
@@ -689,9 +829,10 @@ mod tests {
         let Command::Server(args) = cli.command else {
             panic!("expected server command");
         };
-        assert_eq!(args.serial, "/dev/ttyACM0");
+        assert_eq!(args.serial.as_deref(), Some("/dev/ttyACM0"));
+        assert!(args.config.is_none());
         assert_eq!(args.baud, 9600);
-        assert_eq!(args.listen, "0.0.0.0:8000".parse().unwrap());
+        assert_eq!(args.listen, Some("0.0.0.0:8000".parse().unwrap()));
         assert!(args.dtr_reset);
     }
 
@@ -701,7 +842,7 @@ mod tests {
             "uart-proxy",
             "client",
             "--connect",
-            "192.0.2.1:7000",
+            "ws://192.0.2.1:7000/arduino",
             "--link",
             "/tmp/remote-arduino",
         ])
@@ -710,7 +851,7 @@ mod tests {
         let Command::Client(args) = cli.command else {
             panic!("expected client command");
         };
-        assert_eq!(args.connect, "192.0.2.1:7000".parse().unwrap());
+        assert_eq!(args.connect, "ws://192.0.2.1:7000/arduino");
         assert_eq!(args.link, Some(PathBuf::from("/tmp/remote-arduino")));
         assert_eq!(args.reconnect_delay_ms, 1_000);
         assert!(!args.no_modem_control);
@@ -718,10 +859,8 @@ mod tests {
 
     #[tokio::test]
     async fn round_trips_data_frame() {
-        let (mut writer, mut reader) = tokio::io::duplex(128);
-        write_data_frame(&mut writer, b"serial data").await.unwrap();
-
-        let Some(Frame::Data(data)) = read_frame(&mut reader).await.unwrap() else {
+        let message = encode_frame(FRAME_DATA, b"serial data").unwrap();
+        let Some(Frame::Data(data)) = read_websocket_frame(Some(Ok(message))).unwrap() else {
             panic!("expected data frame");
         };
         assert_eq!(data, b"serial data");
@@ -729,16 +868,39 @@ mod tests {
 
     #[tokio::test]
     async fn round_trips_modem_control_frame() {
-        let (mut writer, mut reader) = tokio::io::duplex(128);
-        write_modem_control_frame(&mut writer, MODEM_DTR | MODEM_RTS, MODEM_DTR)
-            .await
-            .unwrap();
-
-        let Some(Frame::ModemControl { mask, values }) = read_frame(&mut reader).await.unwrap()
+        let message =
+            encode_frame(FRAME_MODEM_CONTROL, &[MODEM_DTR | MODEM_RTS, MODEM_DTR]).unwrap();
+        let Some(Frame::ModemControl { mask, values }) =
+            read_websocket_frame(Some(Ok(message))).unwrap()
         else {
             panic!("expected modem-control frame");
         };
         assert_eq!(mask, MODEM_DTR | MODEM_RTS);
         assert_eq!(values, MODEM_DTR);
+    }
+
+    #[test]
+    fn parses_multi_port_configuration() {
+        let config: ServerFileConfig = toml::from_str(
+            r#"
+                listen = "0.0.0.0:7000"
+
+                [ports.com1]
+                device = "COM1"
+
+                [ports.arduino]
+                device = "/dev/ttyACM0"
+                baud = 57600
+                dtr_reset = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.listen, Some("0.0.0.0:7000".parse().unwrap()));
+        assert_eq!(config.ports["com1"].device, "COM1");
+        assert_eq!(config.ports["com1"].baud, 115_200);
+        assert_eq!(config.ports["arduino"].baud, 57_600);
+        assert!(config.ports["arduino"].dtr_reset);
+        validate_routes(&config.ports).unwrap();
     }
 }

@@ -2,7 +2,7 @@
 name = "uart-proxy"
 version = "0.1.0"
 edition = "2024"
-description = "Expose a serial port over TCP and recreate it as a Linux PTY"
+description = "Expose serial ports over WebSockets and recreate them as Linux PTYs"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/jprendes/uart-proxy"
@@ -10,8 +10,12 @@ repository = "https://github.com/jprendes/uart-proxy"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", features = ["sink"] }
+serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-serial = { version = "5.4", default-features = false }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+toml = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["fs", "inotify", "term"] }
